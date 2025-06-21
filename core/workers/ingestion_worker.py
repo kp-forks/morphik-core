@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -24,13 +25,11 @@ from core.services.rules_processor import RulesProcessor
 from core.services.telemetry import TelemetryService
 from core.storage.local_storage import LocalStorage
 from core.storage.s3_storage import S3Storage
-from core.vector_store.milvus_multivector_store import MilvusMultiVectorStore
-from core.vector_store.milvus_vector_store import MilvusVectorStore
 from core.vector_store.multi_vector_store import MultiVectorStore
 from core.vector_store.pgvector_store import PGVectorStore
 
 # Enterprise routing helpers
-from ee.db_router import get_database_for_app, get_multi_vector_store_for_app, get_vector_store_for_app
+from ee.db_router import get_database_for_app, get_vector_store_for_app
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +100,42 @@ async def get_document_with_retry(document_service, document_id, auth, max_retri
                 return None
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Profiling helpers (worker-level)
+# ---------------------------------------------------------------------------
+
+if os.getenv("ENABLE_PROFILING") == "1":
+    try:
+        import yappi  # type: ignore
+    except ImportError:
+        yappi = None
+else:
+    yappi = None
+
+
+@contextlib.asynccontextmanager
+async def _profile_ctx(label: str):  # type: ignore
+    if yappi is None:
+        yield
+        return
+
+    yappi.clear_stats()
+    yappi.set_clock_type("cpu")
+    yappi.start()
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        duration = time.perf_counter() - t0
+        fname = f"logs/worker_{label}_{int(t0)}.prof"
+        yappi.stop()
+        try:
+            yappi.get_func_stats().save(fname, type="pstat")
+            logger.info("Saved worker profile %s (%.2fs) to %s", label, duration, fname)
+        except Exception as exc:
+            logger.warning("Could not save worker profile: %s", exc)
 
 
 async def process_ingestion_job(
@@ -177,17 +212,26 @@ async def process_ingestion_job(
         colpali_vector_store = None
         if use_colpali:
             try:
-                # Use the enterprise routing helper to get the appropriate multivector store
-                # This will respect the configuration settings (postgres vs milvus)
-                colpali_vector_store = await get_multi_vector_store_for_app(auth.app_id)
+                # Use render_as_string(hide_password=False) so the URI keeps the
+                # password – str(engine.url) masks it with "***" which breaks
+                # authentication for psycopg.  Also append sslmode=require when
+                # missing to satisfy Neon.
+                from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-                # Initialize the store if it has an initialize method (PostgreSQL-based stores)
-                if colpali_vector_store and hasattr(colpali_vector_store, "initialize"):
-                    await asyncio.to_thread(colpali_vector_store.initialize)
+                uri_raw = database.engine.url.render_as_string(hide_password=False)
 
-                logger.info(f"Initialized ColPali multivector store for app {auth.app_id}")
+                parsed = urlparse(uri_raw)
+                query = parse_qs(parsed.query)
+                if "sslmode" not in query and settings.MODE == "cloud":
+                    query["sslmode"] = ["require"]
+                    parsed = parsed._replace(query=urlencode(query, doseq=True))
+
+                uri_final = urlunparse(parsed)
+
+                colpali_vector_store = MultiVectorStore(uri=uri_final)
+                await asyncio.to_thread(colpali_vector_store.initialize)
             except Exception as e:
-                logger.warning(f"Failed to initialise ColPali multivector store for app {auth.app_id}: {e}")
+                logger.warning(f"Failed to initialise ColPali MultiVectorStore for app {auth.app_id}: {e}")
 
         # Build a fresh DocumentService scoped to this job/app so we don't
         # mutate the shared instance kept in *ctx* (avoids cross-talk between
@@ -555,12 +599,11 @@ async def process_ingestion_job(
                     colpali_chunks_count=colpali_count_for_limit_fn,
                 )
             except Exception as rec_exc:
-                # Log error but don't fail the job at this point
                 logger.error("Failed to record ingest usage after completion: %s", rec_exc)
 
         # 14. Return document ID
         return {
-            "document_id": doc.external_id,
+            "document_id": document_id,
             "status": "completed",
             "filename": original_filename,
             "content_type": content_type,
@@ -568,6 +611,7 @@ async def process_ingestion_job(
         }
 
     except Exception as e:
+        # ... (rest of the function remains the same)
         logger.error(f"Error processing ingestion job for file {original_filename}: {str(e)}")
 
         # ------------------------------------------------------------------
@@ -648,18 +692,11 @@ async def startup(ctx):
         logger.error("Database initialization failed")
     ctx["database"] = database
 
-    # Initialize vector store based on configuration
-    logger.info(f"Initializing primary vector store (provider: {settings.VECTOR_STORE_PROVIDER})...")
-    if settings.VECTOR_STORE_PROVIDER == "milvus":
-        vector_store = MilvusVectorStore()
-        logger.info("Using Milvus for primary vector storage")
-        # Milvus stores don't have an async initialize method like PGVector
-        success = True
-    else:
-        vector_store = PGVectorStore(uri=settings.POSTGRES_URI)
-        success = await vector_store.initialize()
-        logger.info("Using PGVector for primary vector storage")
-
+    # Initialize vector store
+    logger.info("Initializing primary vector store...")
+    vector_store = PGVectorStore(uri=settings.POSTGRES_URI)
+    # vector_store = PGVectorStore(uri="postgresql+asyncpg://morphik:morphik@postgres:5432/morphik")
+    success = await vector_store.initialize()
     if success:
         logger.info("Primary vector store initialization successful")
     else:
@@ -704,9 +741,7 @@ async def startup(ctx):
     colpali_vector_store = None
 
     if settings.COLPALI_MODE != "off":
-        logger.info(
-            f"Initializing ColPali components (mode={settings.COLPALI_MODE}, provider={settings.MULTIVECTOR_PROVIDER}) ..."
-        )
+        logger.info(f"Initializing ColPali components (mode={settings.COLPALI_MODE}) ...")
         # Choose embedding implementation
         match settings.COLPALI_MODE:
             case "local":
@@ -716,16 +751,10 @@ async def startup(ctx):
             case _:
                 raise ValueError(f"Unsupported COLPALI_MODE: {settings.COLPALI_MODE}")
 
-        # Initialize multivector store based on configuration
-        if settings.MULTIVECTOR_PROVIDER == "milvus":
-            colpali_vector_store = MilvusMultiVectorStore()
-            logger.info("Using Milvus for ColPali multi-vector storage")
-            success = True  # Milvus auto-initializes
-        else:
-            colpali_vector_store = MultiVectorStore(uri=settings.POSTGRES_URI)
-            success = await asyncio.to_thread(colpali_vector_store.initialize)
-            logger.info("Using PostgreSQL for ColPali multi-vector storage")
-
+        # Vector store is needed for both local and api modes
+        colpali_vector_store = MultiVectorStore(uri=settings.POSTGRES_URI)
+        # colpali_vector_store = MultiVectorStore(uri="postgresql+asyncpg://morphik:morphik@postgres:5432/morphik")
+        success = await asyncio.to_thread(colpali_vector_store.initialize)
         if success:
             logger.info("ColPali vector store initialization successful")
         else:
